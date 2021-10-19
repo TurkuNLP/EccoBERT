@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=tok
-#SBATCH --account=project_2000230
+#SBATCH --account=project_2005072
 #SBATCH --partition=medium
-#SBATCH --time=18:00:00
+#SBATCH --time=7:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 ##SBATCH --gres=gpu:a100:1
@@ -14,5 +14,6 @@
 ## to access the local fast storage on each node.
 
 module load pytorch/1.9
-singularity_wrapper exec python3 train_tokenizer.py
+singularity_wrapper exec python3 train_tokenizer.py --filelist $1 --N 10000 --out $2
+
 
