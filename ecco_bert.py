@@ -18,7 +18,7 @@ def transpose(l):
 
 def load_fields(fn):
     with gzip.open(fn, 'rt') as f:
-        return transpose([l.rstrip('\n').split('\t') for l in f])
+        return transpose([l.rstrip('\n').split('\t') for l in f][:50000])
 
 class EccoBERT(pl.LightningModule):
 
@@ -223,6 +223,7 @@ if __name__ == '__main__':
         accelerator='ddp',
         precision=16,
         val_check_interval=5000,
+        limit_val_batches=300,
         # val_check_interval=1.0,
         num_sanity_val_steps=5,
         max_steps=max_steps,
