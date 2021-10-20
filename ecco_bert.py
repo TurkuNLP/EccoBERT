@@ -229,9 +229,9 @@ if __name__ == '__main__':
         max_steps=max_steps,
         # max_epochs=2,
         accumulate_grad_batches=11,
-        progress_bar_refresh_rate=50, # Large value prevents crashing in colab
+        progress_bar_refresh_rate=5, # Large value prevents crashing in colab
         callbacks=[CheckpointEpoch(out_dir=args.out_dir, every_n_epochs=100), lr_monitor],
-        reload_dataloaders_every_epoch=True, # TODO: Will be removed in Pytorch Lightning v1.6. Replace with the line below.
+        # reload_dataloaders_every_epoch=True, # TODO: Will be removed in Pytorch Lightning v1.6. Replace with the line below.
         # reload_dataloaders_every_n_epochs=1,
         resume_from_checkpoint=args.load_checkpoint
     )
