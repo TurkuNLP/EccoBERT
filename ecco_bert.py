@@ -7,6 +7,8 @@ import random
 import collections
 import itertools
 import gzip
+import tqdm 
+import sys
 
 def pad(l, size):
     return l + [0]*(size - len(l))
@@ -16,7 +18,7 @@ def transpose(l):
 
 def load_fields(fn):
     with gzip.open(fn, 'rt') as f:
-        return transpose([l.rstrip('\n').split('\t') for l in f])
+        return transpose([l.rstrip('\n').split('\t') for l in f][:50000])
 
 class EccoBERT(pl.LightningModule):
 
@@ -141,17 +143,22 @@ class MiniEpochDataModule(pl.LightningDataModule):
         self.data_collator = transformers.DataCollatorForWholeWordMask(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
         self.collate_fn = lambda x: collate(x, self.data_collator, self.tokenizer.pad_token_id)
 
-    def setup(self, stage=None):
-        self.dev_data = EccoDataset.from_newline_delimited(self.dev_fname, input_size=self.input_size, tokenizer=self.tokenizer)
+    #def setup(self, stage=None):
+    #    self.dev_data = EccoDataset.from_newline_delimited(self.dev_fname, input_size=self.input_size, tokenizer=self.tokenizer)
 
     def train_dataloader(self):
-        fn = self.train_files[self.trainer.current_epoch % len(self.train_files)]
-        print(f"Current epoch: {self.trainer.current_epoch}, loading file: {fn}", flush=True)
+        if not self.trainer:
+            epoch_num=self.current_epoch #this is only set when --only-loop-data is used
+        else:
+            epoch_num=self.trainer.current_epoch
+        fn = self.train_files[epoch_num % len(self.train_files)]
+        print(f"Current epoch: {epoch_num}, loading file: {fn}", flush=True)
         dataset = EccoDataset.from_newline_delimited(fn, input_size=self.input_size, tokenizer=self.tokenizer)
         return torch.utils.data.DataLoader(dataset, collate_fn=self.collate_fn, batch_size=self.batch_size, num_workers=1, pin_memory=True)
 
     def val_dataloader(self): 
-        return torch.utils.data.DataLoader(self.dev_data, collate_fn=self.collate_fn, batch_size=self.batch_size, num_workers=1, pin_memory=True)
+        dataset=EccoDataset.from_newline_delimited(self.dev_fname, input_size=self.input_size, tokenizer=self.tokenizer)
+        return torch.utils.data.DataLoader(dataset, collate_fn=self.collate_fn, batch_size=self.batch_size, num_workers=1, pin_memory=True)
 
 class CheckpointEpoch(pl.callbacks.Callback):
     def __init__(self, out_dir, every_n_epochs):
@@ -169,6 +176,9 @@ if __name__ == '__main__':
     parser.add_argument('eval', help="A TSV file containing the full unannotated evaluation texts.")
     parser.add_argument('out_dir', help="A directory to which the model is saved.")
     parser.add_argument('--load_checkpoint', help="A path to a checkpoint file to load.")
+    parser.add_argument('--only-loop-data', action="store_true", default=False, help="Just loop over the data do nothing else")
+    parser.add_argument('--gpus', type=int, default=1, help="Number of GPUs per node")
+    parser.add_argument('--nodes', type=int, default=1, help="Number of nodes")
 
     args = parser.parse_args()
 
@@ -177,12 +187,24 @@ if __name__ == '__main__':
     max_steps = 9e5
     # max_steps = 1500
     model_name = "TurkuNLP/bert-base-finnish-cased-v1"
-    gpus = [0, 1, 2, 3]
-    num_nodes = 2
+    gpus = args.gpus
+    num_nodes = args.nodes
+    # TODO: THIS MUST BE SHUFFLED BECAUSE WE CANNOT KNOW WHETHER THE FILES DONT COME IN SOME DESTRUCTIVE ORDER -Filip
     train_files = [l.rstrip('\n') for l in open(args.train).readlines()]
 
     # TODO: Get the special tokens from the vocabulary file
     tokenizer = transformers.PreTrainedTokenizerFast(tokenizer_file=args.tokenizer, unk_token='[UNK]', cls_token='[CLS]', sep_token='[SEP]', pad_token='[PAD]', mask_token='[MASK]')
+    data = MiniEpochDataModule(batch_size=batch_size, tokenizer=tokenizer, input_size=input_size, train_files=train_files, dev_fname=args.eval)
+    data.setup()
+
+    if args.only_loop_data:
+        for e in range(200):
+            data.current_epoch=e
+            for batch in tqdm.tqdm(data.train_dataloader()):
+                pass
+                #print(list(batch.keys()))
+        sys.exit(0)
+
 
     if args.load_checkpoint:
         model = EccoBERT.load_from_checkpoint(checkpoint_path=args.load_checkpoint)
@@ -191,23 +213,22 @@ if __name__ == '__main__':
         steps_train = 1e6
         model = EccoBERT(bert_model=model_name, steps_train=steps_train)
 
-    data = MiniEpochDataModule(batch_size=batch_size, tokenizer=tokenizer, input_size=input_size, train_files=train_files, dev_fname=args.eval)
-    data.setup()
-
     lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='step')
 
     # train BERT and evaluate
     trainer = pl.Trainer(
         num_nodes=num_nodes,
         gpus=gpus,
+        auto_select_gpus=True,
         accelerator='ddp',
         precision=16,
         val_check_interval=5000,
+        limit_val_batches=300,
         # val_check_interval=1.0,
         num_sanity_val_steps=5,
         max_steps=max_steps,
         # max_epochs=2,
-        accumulate_grad_batches=4,
+        accumulate_grad_batches=11,
         progress_bar_refresh_rate=50, # Large value prevents crashing in colab
         callbacks=[CheckpointEpoch(out_dir=args.out_dir, every_n_epochs=100), lr_monitor],
         reload_dataloaders_every_epoch=True, # TODO: Will be removed in Pytorch Lightning v1.6. Replace with the line below.
