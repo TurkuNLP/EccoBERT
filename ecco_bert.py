@@ -9,6 +9,7 @@ import itertools
 import gzip
 import tqdm 
 import sys
+import math
 
 def pad(l, size):
     return l + [0]*(size - len(l))
@@ -71,8 +72,8 @@ def sliding_window(iterable, n):
 # Segment a list of strings into tokenized chunks, with a maximum length of 256 tokens.
 # Segments shorter than 150 tokens are generated only at end-of-document positions.
 def segment(tokenizer, group_texts):
-    min_len = 150
-    max_len = 255
+    min_len = 128
+    max_len = 384
     for text in group_texts:
         t_ids = tokenizer(text, add_special_tokens=False)['input_ids']
         t_tokens = tokenizer.convert_ids_to_tokens(t_ids)
@@ -87,34 +88,57 @@ def segment(tokenizer, group_texts):
             yield t_ids[i:split]
             i = split
 
-def to_example(window, cls, sep):
+def to_example(input_size, cls, sep, window):
     w1 = window[0]
     w2, next_sentence_label = (window[1], 0) if random.random() > 0.5 else (random.choice(window[2:]), 1)
+    effective_input_size = input_size - 3
+    if len(w1) + len(w2) > effective_input_size:
+        min_length = min(len(w1), len(w2))
+        if min_length > effective_input_size / 2:
+            max_allowed = effective_input_size / 2
+        else:
+            max_allowed = effective_input_size - min_length
+        
+        # Trim from opposite ends to keep the sentence boundary intact for NSP.
+        # Use ceiling and floor in case min_length > effective_input_size / 2, to get the otherwise unused
+        # last token position when effective_input_size is odd.
+        # For example, input_size=512 -> effective_input_size=509 -> len(w1)=255, len(w2)=254
+        w1 = w1[-math.ceil(max_allowed):]
+        w2 = w2[:math.floor(max_allowed)]
+        
     return {'input_ids': [cls] + w1 + [sep] + w2 + [sep], 'token_type_ids': [0]*(len(w1)+2) + [1]*(len(w2)+1), 'attention_mask': [1]*(len(w1)+len(w2)+3), 'next_sentence_label': next_sentence_label}
 
-class EccoDataset(torch.utils.data.IterableDataset):
-    def __init__(self, tokenizer, input_size, group_texts):
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.input_size = input_size
-        self.group_texts = group_texts
-
-    @classmethod
-    def from_newline_delimited(cls, fname, tokenizer, input_size):
-        group_texts_raw = load_fields(fname)[0]
-        group_texts = []
+def group_text_gen(gpu_id, fnames):
+    for fname in fnames:
+        print(f"GPU {gpu_id} worker {torch.utils.data.get_worker_info().id} opening file {fname}", flush=True)
         group_text = []
-        for text in group_texts_raw:
+        for text in load_fields(fname)[0]:
             if not text:
-                group_texts.append(' '.join(group_text))
+                yield ' '.join(group_text)
                 group_text = []
             else:
                 group_text.append(text)
 
-        return cls(tokenizer=tokenizer, input_size=input_size, group_texts=group_texts)
+# Cycle a list, with each cycle being a random permutation of the list.
+def random_permutation_cycle(ls):
+    while True:
+        shuffled = random.sample(ls, len(ls))
+        for e in shuffled:
+            yield e
+
+class EccoDataset(torch.utils.data.IterableDataset):
+    def __init__(self, gpu_id, tokenizer, input_size, file_names):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.input_size = input_size
+        self.gpu_id = gpu_id
+        self.file_names = file_names
 
     def __iter__(self):
-        return (to_example(window, cls=self.tokenizer.cls_token_id, sep=self.tokenizer.sep_token_id) for window in sliding_window(segment(self.tokenizer, self.group_texts), 50))
+        worker_info = torch.utils.data.get_worker_info()
+        file_name_slice = itertools.islice(self.file_names, worker_info.id, None, worker_info.num_workers)
+        self.group_text_gen = group_text_gen(self.gpu_id, file_name_slice)
+        return (to_example(input_size=self.input_size, cls=self.tokenizer.cls_token_id, sep=self.tokenizer.sep_token_id, window=window) for window in sliding_window(segment(self.tokenizer, self.group_text_gen), 50))
 
 def pad_with_value(vals, padding_value):
     vals=[torch.LongTensor(v) for v in vals]
@@ -143,31 +167,28 @@ class MiniEpochDataModule(pl.LightningDataModule):
         self.data_collator = transformers.DataCollatorForWholeWordMask(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
         self.collate_fn = lambda x: collate(x, self.data_collator, self.tokenizer.pad_token_id)
 
-    #def setup(self, stage=None):
-    #    self.dev_data = EccoDataset.from_newline_delimited(self.dev_fname, input_size=self.input_size, tokenizer=self.tokenizer)
-
     def train_dataloader(self):
-        if not self.trainer:
-            epoch_num=self.current_epoch #this is only set when --only-loop-data is used
-        else:
-            epoch_num=self.trainer.current_epoch
-        fn = self.train_files[epoch_num % len(self.train_files)]
-        print(f"Current epoch: {epoch_num}, loading file: {fn}", flush=True)
-        dataset = EccoDataset.from_newline_delimited(fn, input_size=self.input_size, tokenizer=self.tokenizer)
-        return torch.utils.data.DataLoader(dataset, collate_fn=self.collate_fn, batch_size=self.batch_size, num_workers=1, pin_memory=True)
+        num_devices = self.trainer.num_nodes*self.trainer.num_gpus
+        intervals = [round(n * (len(self.train_files)/num_devices)) for n in range(num_devices)] + [len(self.train_files)]
+        device_id = self.trainer.node_rank*self.trainer.num_gpus + self.trainer.root_gpu
+        fns = random_permutation_cycle(self.train_files[intervals[device_id]:intervals[device_id+1]]) # Infinite dataset
+        print(f"Node: {self.trainer.node_rank}, GPU: {self.trainer.root_gpu}, loading files between: {(intervals[device_id], intervals[device_id+1])}", flush=True)
+        dataset = EccoDataset(gpu_id=self.trainer.root_gpu, input_size=self.input_size, tokenizer=self.tokenizer, file_names=fns)
+        return torch.utils.data.DataLoader(dataset, collate_fn=self.collate_fn, batch_size=self.batch_size, num_workers=8, pin_memory=True)
 
     def val_dataloader(self): 
-        dataset=EccoDataset.from_newline_delimited(self.dev_fname, input_size=self.input_size, tokenizer=self.tokenizer)
+        # Note that the evaluation dataset isn't deterministic due to the random segment splits and sliding window NSP approach.
+        dataset = EccoDataset(gpu_id=self.trainer.root_gpu, input_size=self.input_size, tokenizer=self.tokenizer, file_names=[self.dev_fname])
         return torch.utils.data.DataLoader(dataset, collate_fn=self.collate_fn, batch_size=self.batch_size, num_workers=1, pin_memory=True)
 
-class CheckpointEpoch(pl.callbacks.Callback):
-    def __init__(self, out_dir, every_n_epochs):
+class CheckpointSteps(pl.callbacks.Callback):
+    def __init__(self, out_dir, every_n_steps):
         self.out_dir = out_dir
-        self.every_n_epochs = every_n_epochs
+        self.every_n_steps = every_n_steps
 
-    def on_train_epoch_end(self, trainer, _):
-        if (trainer.current_epoch + 1) % self.every_n_epochs == 0:
-            trainer.save_checkpoint(self.out_dir + f'/epoch-{trainer.current_epoch}.ckpt')
+    def on_train_batch_end(self, trainer, *args):
+        if (trainer.global_step + 1) % self.every_n_steps == 0:
+            trainer.save_checkpoint(self.out_dir + f'/step-{trainer.global_step+1}.ckpt')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -183,14 +204,15 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     input_size = 512
-    batch_size = 8
-    max_steps = 9e5
+    batch_size = 24
+    max_steps = 1e6
     # max_steps = 1500
     model_name = "TurkuNLP/bert-base-finnish-cased-v1"
     gpus = args.gpus
     num_nodes = args.nodes
-    # TODO: THIS MUST BE SHUFFLED BECAUSE WE CANNOT KNOW WHETHER THE FILES DONT COME IN SOME DESTRUCTIVE ORDER -Filip
     train_files = [l.rstrip('\n') for l in open(args.train).readlines()]
+    random.shuffle(train_files)
+    print(f"Number of nodes {num_nodes}, number of GPUs per node {gpus}, batch size {batch_size}")
 
     # TODO: Get the special tokens from the vocabulary file
     tokenizer = transformers.PreTrainedTokenizerFast(tokenizer_file=args.tokenizer, unk_token='[UNK]', cls_token='[CLS]', sep_token='[SEP]', pad_token='[PAD]', mask_token='[MASK]')
@@ -204,7 +226,6 @@ if __name__ == '__main__':
                 pass
                 #print(list(batch.keys()))
         sys.exit(0)
-
 
     if args.load_checkpoint:
         model = EccoBERT.load_from_checkpoint(checkpoint_path=args.load_checkpoint)
@@ -228,11 +249,12 @@ if __name__ == '__main__':
         num_sanity_val_steps=5,
         max_steps=max_steps,
         # max_epochs=2,
-        accumulate_grad_batches=11,
+        accumulate_grad_batches=4,
         progress_bar_refresh_rate=50, # Large value prevents crashing in colab
-        callbacks=[CheckpointEpoch(out_dir=args.out_dir, every_n_epochs=100), lr_monitor],
-        reload_dataloaders_every_epoch=True, # TODO: Will be removed in Pytorch Lightning v1.6. Replace with the line below.
-        # reload_dataloaders_every_n_epochs=1,
+        callbacks=[CheckpointSteps(out_dir=args.out_dir, every_n_steps=10000), lr_monitor],
+        checkpoint_callback=False,
+        # reload_dataloaders_every_epoch=True, # TODO: Will be removed in Pytorch Lightning v1.6. Replace with the line below.
+        ## reload_dataloaders_every_n_epochs=1,
         resume_from_checkpoint=args.load_checkpoint
     )
 
