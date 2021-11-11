@@ -30,8 +30,8 @@ echo "Slurm job ID: $SLURM_JOB_ID"
 
 if [ $# -eq 4 ]
 then
-    srun python ecco_bert.py $TOKENIZER $TRAINDATA $DEVDATA $OUTDIR --gpus $NGPUS --nodes $NNODES 
+    srun python ecco_bert.py $TOKENIZER $TRAINDATA $DEVDATA $OUTDIR --model bert --gpus $NGPUS --nodes $NNODES 
 elif [ $# -eq 5 ]
 then
-    srun python ecco_bert.py $TOKENIZER $TRAINDATA $DEVDATA $OUTDIR --gpus $NGPUS --nodes $NNODES --load_checkpoint $5 
+    srun python ecco_bert.py $TOKENIZER $TRAINDATA $DEVDATA $OUTDIR --model bert --gpus $NGPUS --nodes $NNODES --load_checkpoint $5 
 fi

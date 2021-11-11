@@ -2,7 +2,6 @@ import pytorch_lightning as pl
 import transformers
 import torch
 import argparse
-import bisect
 import random
 import collections
 import itertools
@@ -23,21 +22,31 @@ def load_fields(fn):
 
 class EccoBERT(pl.LightningModule):
 
-    def __init__(self, bert_model, steps_train=None):
+    def __init__(self, model_type, vocab_size, lr, steps_train=None):
         super().__init__()
         self.save_hyperparameters()
-        configuration = transformers.BertConfig.from_pretrained(bert_model)
         self.steps_train = steps_train
-        self.bert=transformers.BertForPreTraining(configuration)
+        if model_type == 'bert':
+            model_name = "TurkuNLP/bert-base-finnish-cased-v1"
+            config_class = transformers.BertConfig
+            model_class = transformers.BertForPreTraining
+        elif model_type == 'bigbird':
+            model_name = "google/bigbird-roberta-base"
+            config_class = transformers.BigBirdConfig
+            model_class = transformers.BigBirdForPreTraining
+        
+        configuration = config_class.from_pretrained(model_name, vocab_size=vocab_size)
+        self.model = model_class(configuration)
+        self.lr = lr
         # self.accuracy = pl.metrics.Accuracy()
         # self.val_accuracy = pl.metrics.Accuracy()
 
     def forward(self,batch):
-        return self.bert(input_ids=batch['input_ids'],
-                         attention_mask=batch['attention_mask'],
-                         token_type_ids=batch['token_type_ids'],
-                         labels=batch['label'],
-                         next_sentence_label=batch['next_sentence_label']) #BxS_LENxSIZE; BxSIZE
+        return self.model(input_ids=batch['input_ids'],
+                          attention_mask=batch['attention_mask'],
+                          token_type_ids=batch['token_type_ids'],
+                          labels=batch['label'],
+                          next_sentence_label=batch['next_sentence_label']) #BxS_LENxSIZE; BxSIZE
 
     def training_step(self,batch,batch_idx):
         outputs = self(batch)
@@ -45,18 +54,37 @@ class EccoBERT(pl.LightningModule):
         # self.log("train_acc", self.accuracy, prog_bar=True, on_step=True, on_epoch=True)
         # self.log("linear_scheduler", )
         self.log("loss", outputs.loss)
+        # loss_function = torch.nn.CrossEntropyLoss()
+        # self.log('masked_lm_loss', loss_function(outputs.prediction_logits.view(-1, self.bert.config.vocab_size), batch['label'].view(-1)))
+        # self.log('next_sentence_loss', loss_function(outputs.seq_relationship_logits.view(-1, 2), batch['next_sentence_label'].view(-1)))
         return outputs.loss
 
     def validation_step(self,batch,batch_idx):
         outputs = self(batch)
         self.log("val_loss", outputs.loss, prog_bar=True)
+        # TODO: Calculate whole word accuracy
+
+        # loss_function = torch.nn.CrossEntropyLoss()
+        # self.log('val_masked_lm_loss', loss_function(outputs.prediction_logits.view(-1, self.bert.config.vocab_size), batch['label'].view(-1)), prog_bar=True)
+        # self.log('val_next_sentence_loss', loss_function(outputs.seq_relationship_logits.view(-1, 2), batch['next_sentence_label'].view(-1)), prog_bar=True)
         # self.log("val_acc", self.val_accuracy, prog_bar=True, on_epoch=True)
+        # return outputs
 
     def configure_optimizers(self):
-        optimizer = transformers.optimization.AdamW(self.parameters(), lr=8e-5, weight_decay=0.01)
+        optimizer = transformers.optimization.AdamW(self.parameters(), lr=self.lr, weight_decay=0.01)
         scheduler = transformers.optimization.get_linear_schedule_with_warmup(optimizer, num_warmup_steps=10000, num_training_steps=self.steps_train)
         scheduler = {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}
         return [optimizer], [scheduler]
+
+#class EccoBigBird(EccoBERT):
+#    def __init__(self, block_size, **args):
+#        super().__init__(**args)
+#        self.save_hyperparameters()
+#        self.model = transformers.BigBirdForPreTraining(args['configuration'])
+#        self.block_size = block_size
+#
+#    def forward(self, batch):
+#        return super().forward(aligned)
 
 # From https://docs.python.org/3/library/itertools.html#itertools-recipes
 def sliding_window(iterable, n):
@@ -69,11 +97,11 @@ def sliding_window(iterable, n):
         window.append(x)
         yield tuple(window)
 
-# Segment a list of strings into tokenized chunks, with a maximum length of 256 tokens.
-# Segments shorter than 150 tokens are generated only at end-of-document positions.
-def segment(tokenizer, group_texts):
+# Segment a list of strings into tokenized chunks, with a maximum length of 75 % of the maximum input size.
+# Segments shorter than 128 tokens are generated only at end-of-document positions.
+def segment(tokenizer, input_size, group_texts):
     min_len = 128
-    max_len = 384
+    max_len = math.floor(0.75*input_size)
     for text in group_texts:
         t_ids = tokenizer(text, add_special_tokens=False)['input_ids']
         t_tokens = tokenizer.convert_ids_to_tokens(t_ids)
@@ -138,25 +166,38 @@ class EccoDataset(torch.utils.data.IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         file_name_slice = itertools.islice(self.file_names, worker_info.id, None, worker_info.num_workers)
         self.group_text_gen = group_text_gen(self.gpu_id, file_name_slice)
-        return (to_example(input_size=self.input_size, cls=self.tokenizer.cls_token_id, sep=self.tokenizer.sep_token_id, window=window) for window in sliding_window(segment(self.tokenizer, self.group_text_gen), 50))
+        return (to_example(input_size=self.input_size, cls=self.tokenizer.cls_token_id, sep=self.tokenizer.sep_token_id, window=window) for window in sliding_window(segment(self.tokenizer, self.input_size, self.group_text_gen), 50))
 
 def pad_with_value(vals, padding_value):
     vals=[torch.LongTensor(v) for v in vals]
     return torch.nn.utils.rnn.pad_sequence(vals, batch_first=True, padding_value=padding_value)
 
 def collate(itemlist, data_collator, pad_token_id):
-    batch={}
+    batch = {}
     masked = data_collator(itemlist)
 
     batch['attention_mask'] = pad_with_value([item['attention_mask'] for item in itemlist], pad_token_id) # Here pad_token_id=3
     batch['token_type_ids'] = pad_with_value([item['token_type_ids'] for item in itemlist], 0) # Can't use pad_token_id since index out of bounds
     batch['input_ids'] = masked['input_ids']
     batch['label'] = masked['labels']
+
     batch['next_sentence_label'] = torch.tensor([item['next_sentence_label'] for item in itemlist], dtype=torch.long)
-    
+ 
     return batch
 
-class MiniEpochDataModule(pl.LightningDataModule):
+# Pad batch tensors to minimum length and block size alignment.
+def collate_bigbird(itemlist, data_collator, pad_token_id, block_size):
+    batch = collate(itemlist, data_collator, pad_token_id)
+    # TODO: Calculate minimum length from num_random_blocks of the Big Bird configuration
+    block_aligned_length = max(math.ceil(batch['input_ids'].size(1) / block_size), 12) * block_size
+    for k, fill in [('attention_mask', pad_token_id), ('token_type_ids', 0), ('input_ids', pad_token_id), ('label', pad_token_id)]:
+        padded = torch.full([batch[k].size(0), block_aligned_length], fill)
+        padded[:, :batch[k].size(1)] = batch[k]
+        batch[k] = padded
+
+    return batch
+
+class EccoDataModule(pl.LightningDataModule):
     def __init__(self, batch_size, tokenizer, input_size, train_files, dev_fname):
         super().__init__()
         self.batch_size = batch_size
@@ -181,6 +222,11 @@ class MiniEpochDataModule(pl.LightningDataModule):
         dataset = EccoDataset(gpu_id=self.trainer.root_gpu, input_size=self.input_size, tokenizer=self.tokenizer, file_names=[self.dev_fname])
         return torch.utils.data.DataLoader(dataset, collate_fn=self.collate_fn, batch_size=self.batch_size, num_workers=1, pin_memory=True)
 
+class EccoBigBirdDataModule(EccoDataModule):
+    def __init__(self, block_size, **args):
+        super().__init__(**args)
+        self.collate_fn = lambda x: collate_bigbird(x, self.data_collator, self.tokenizer.pad_token_id, block_size)
+
 class CheckpointSteps(pl.callbacks.Callback):
     def __init__(self, out_dir, every_n_steps):
         self.out_dir = out_dir
@@ -196,6 +242,7 @@ if __name__ == '__main__':
     parser.add_argument('train', help="A text file containing paths to the training files.")
     parser.add_argument('eval', help="A TSV file containing the full unannotated evaluation texts.")
     parser.add_argument('out_dir', help="A directory to which the model is saved.")
+    parser.add_argument('--model', default='bert', help="The type of model to use ('bert' or 'bigbird')")
     parser.add_argument('--load_checkpoint', help="A path to a checkpoint file to load.")
     parser.add_argument('--only-loop-data', action="store_true", default=False, help="Just loop over the data do nothing else")
     parser.add_argument('--gpus', type=int, default=1, help="Number of GPUs per node")
@@ -203,20 +250,29 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    input_size = 512
     batch_size = 24
+    accumulate_grad_batches = 4
+    lr = 1e-4
     max_steps = 1e6
     # max_steps = 1500
-    model_name = "TurkuNLP/bert-base-finnish-cased-v1"
     gpus = args.gpus
     num_nodes = args.nodes
     train_files = [l.rstrip('\n') for l in open(args.train).readlines()]
     random.shuffle(train_files)
-    print(f"Number of nodes {num_nodes}, number of GPUs per node {gpus}, batch size {batch_size}")
 
-    # TODO: Get the special tokens from the vocabulary file
-    tokenizer = transformers.PreTrainedTokenizerFast(tokenizer_file=args.tokenizer, unk_token='[UNK]', cls_token='[CLS]', sep_token='[SEP]', pad_token='[PAD]', mask_token='[MASK]')
-    data = MiniEpochDataModule(batch_size=batch_size, tokenizer=tokenizer, input_size=input_size, train_files=train_files, dev_fname=args.eval)
+    if args.model == 'bert':
+        tokenizer = transformers.BertTokenizerFast.from_pretrained(args.tokenizer)
+        input_size = 512
+        data = EccoDataModule(batch_size=batch_size, tokenizer=tokenizer, input_size=input_size, train_files=train_files, dev_fname=args.eval)
+    else:
+        tokenizer = transformers.BigBirdTokenizerFast.from_pretrained(args.tokenizer)
+        input_size = 4096
+        block_size = 64 # TODO: Get from configuration or model
+        data = EccoBigBirdDataModule(batch_size=batch_size, tokenizer=tokenizer, input_size=input_size, train_files=train_files, dev_fname=args.eval, block_size=block_size)
+
+    print(f"Number of nodes {num_nodes}, GPUs per node {gpus}, batch size {batch_size}, accumulate_grad_batches {accumulate_grad_batches}, learning rate {lr}")
+    print(f"Model {args.model}, tokenizer {args.tokenizer} ({'fast' if tokenizer.is_fast else 'slow'})")
+
     data.setup()
 
     if args.only_loop_data:
@@ -232,7 +288,7 @@ if __name__ == '__main__':
         print("Model loaded from checkpoint.")
     else:
         steps_train = 1e6
-        model = EccoBERT(bert_model=model_name, steps_train=steps_train)
+        model = EccoBERT(model_type=args.model, vocab_size=len(tokenizer), lr=lr, steps_train=steps_train)
 
     lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='step')
 
@@ -249,7 +305,7 @@ if __name__ == '__main__':
         num_sanity_val_steps=5,
         max_steps=max_steps,
         # max_epochs=2,
-        accumulate_grad_batches=4,
+        accumulate_grad_batches=accumulate_grad_batches,
         progress_bar_refresh_rate=50, # Large value prevents crashing in colab
         callbacks=[CheckpointSteps(out_dir=args.out_dir, every_n_steps=10000), lr_monitor],
         checkpoint_callback=False,

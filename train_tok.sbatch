@@ -15,5 +15,3 @@
 
 module load pytorch/1.9
 singularity_wrapper exec python3 train_tokenizer.py --filelist $1 --N 10000 --out $2
-
-

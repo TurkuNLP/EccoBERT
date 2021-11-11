@@ -1,8 +1,8 @@
 import transformers
-import glob
 import random
 import sys
 import argparse
+import gzip
 
 from tokenizers import Tokenizer
 from tokenizers.models import WordPiece
@@ -11,6 +11,11 @@ from tokenizers.normalizers import Lowercase, NFD, StripAccents
 from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 from tokenizers.trainers import WordPieceTrainer
+
+def gzip_iterator(files):
+    for fn in files:
+        with gzip.open(fn, 'rt') as f:
+            yield from f
 
 if __name__=="__main__":
 
@@ -44,6 +49,6 @@ if __name__=="__main__":
     random.shuffle(files)
     print(f"Got {len(files)} files",file=sys.stderr,flush=True)
 
-    trainer = WordPieceTrainer(vocab_size=50000, special_tokens=["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"])
-    bert_tokenizer.train(files[:args.N], trainer)
+    trainer = WordPieceTrainer(vocab_size=500, special_tokens=["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"])
+    bert_tokenizer.train_from_iterator(gzip_iterator(files[:args.N]), trainer)
     bert_tokenizer.save(args.out)
