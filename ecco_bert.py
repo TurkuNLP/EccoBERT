@@ -10,6 +10,8 @@ import tqdm
 import sys
 import math
 
+from sklearn.metrics import classification_report
+
 def pad(l, size):
     return l + [0]*(size - len(l))
 
@@ -26,16 +28,23 @@ class EccoBERT(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.steps_train = steps_train
+        args = {}
         if model_type == 'bert':
             model_name = "TurkuNLP/bert-base-finnish-cased-v1"
             config_class = transformers.BertConfig
             model_class = transformers.BertForPreTraining
+        elif model_type == 'bert-very-large':
+            model_name = 'bert-large-cased'
+            config_class = transformers.BertConfig
+            model_class = transformers.BertForPreTraining
+            args = {'hidden_size': 1032, 'intermediate_size': 4096, 'num_attention_heads': 24, 'num_hidden_layers': 40}
+            print(args)
         elif model_type == 'bigbird':
             model_name = "google/bigbird-roberta-base"
             config_class = transformers.BigBirdConfig
             model_class = transformers.BigBirdForPreTraining
         
-        configuration = config_class.from_pretrained(model_name, vocab_size=vocab_size)
+        configuration = config_class.from_pretrained(model_name, vocab_size=vocab_size, **args)
         self.model = model_class(configuration)
         self.lr = lr
         # self.accuracy = pl.metrics.Accuracy()
@@ -136,6 +145,28 @@ def to_example(input_size, cls, sep, window):
         
     return {'input_ids': [cls] + w1 + [sep] + w2 + [sep], 'token_type_ids': [0]*(len(w1)+2) + [1]*(len(w2)+1), 'attention_mask': [1]*(len(w1)+len(w2)+3), 'next_sentence_label': next_sentence_label}
 
+# TODO: Optimize performance by reading the next chunk while yielding from chunk
+def chunk_shuffle(iterable, chunk_size):
+    args = [iter(iterable)] * chunk_size
+    chunks = (list(chunk) for chunk in zip(*args))
+    for chunk in chunks:
+        random.shuffle(chunk)
+        yield from chunk
+
+#def chunk_shuffle(iterable, chunk_size):
+#    chunk = [e for _, e in zip(range(chunk_size), iterable)]
+#    while True:
+#        random.shuffle(chunk)
+#        next_chunk = []
+#        for i in range(chunk_size):
+#            yield chunk[i]
+#            try:
+#                next_chunk.append(next(iterable))
+#            except StopIteration:
+#                yield from chunk[i+1:]
+#                return
+#        chunk = next_chunk
+
 def group_text_gen(gpu_id, fnames):
     for fname in fnames:
         print(f"GPU {gpu_id} worker {torch.utils.data.get_worker_info().id} opening file {fname}", flush=True)
@@ -155,18 +186,20 @@ def random_permutation_cycle(ls):
             yield e
 
 class EccoDataset(torch.utils.data.IterableDataset):
-    def __init__(self, gpu_id, tokenizer, input_size, file_names):
+    def __init__(self, gpu_id, tokenizer, input_size, file_names, shuffle):
         super().__init__()
         self.tokenizer = tokenizer
         self.input_size = input_size
         self.gpu_id = gpu_id
         self.file_names = file_names
+        self.shuffle = shuffle
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         file_name_slice = itertools.islice(self.file_names, worker_info.id, None, worker_info.num_workers)
         self.group_text_gen = group_text_gen(self.gpu_id, file_name_slice)
-        return (to_example(input_size=self.input_size, cls=self.tokenizer.cls_token_id, sep=self.tokenizer.sep_token_id, window=window) for window in sliding_window(segment(self.tokenizer, self.input_size, self.group_text_gen), 50))
+        example_gen = (to_example(input_size=self.input_size, cls=self.tokenizer.cls_token_id, sep=self.tokenizer.sep_token_id, window=window) for window in sliding_window(segment(self.tokenizer, self.input_size, self.group_text_gen), 50))
+        return chunk_shuffle(example_gen, 250000) if self.shuffle else example_gen
 
 def pad_with_value(vals, padding_value):
     vals=[torch.LongTensor(v) for v in vals]
@@ -214,12 +247,12 @@ class EccoDataModule(pl.LightningDataModule):
         device_id = self.trainer.node_rank*self.trainer.num_gpus + self.trainer.root_gpu
         fns = random_permutation_cycle(self.train_files[intervals[device_id]:intervals[device_id+1]]) # Infinite dataset
         print(f"Node: {self.trainer.node_rank}, GPU: {self.trainer.root_gpu}, loading files between: {(intervals[device_id], intervals[device_id+1])}", flush=True)
-        dataset = EccoDataset(gpu_id=self.trainer.root_gpu, input_size=self.input_size, tokenizer=self.tokenizer, file_names=fns)
+        dataset = EccoDataset(gpu_id=self.trainer.root_gpu, input_size=self.input_size, tokenizer=self.tokenizer, file_names=fns, shuffle=True)
         return torch.utils.data.DataLoader(dataset, collate_fn=self.collate_fn, batch_size=self.batch_size, num_workers=8, pin_memory=True)
 
     def val_dataloader(self): 
         # Note that the evaluation dataset isn't deterministic due to the random segment splits and sliding window NSP approach.
-        dataset = EccoDataset(gpu_id=self.trainer.root_gpu, input_size=self.input_size, tokenizer=self.tokenizer, file_names=[self.dev_fname])
+        dataset = EccoDataset(gpu_id=self.trainer.root_gpu, input_size=self.input_size, tokenizer=self.tokenizer, file_names=[self.dev_fname], shuffle=False)
         return torch.utils.data.DataLoader(dataset, collate_fn=self.collate_fn, batch_size=self.batch_size, num_workers=1, pin_memory=True)
 
 class EccoBigBirdDataModule(EccoDataModule):
@@ -250,9 +283,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    batch_size = 24
-    accumulate_grad_batches = 4
-    lr = 1e-4
+    lr = 6e-5
     max_steps = 1e6
     # max_steps = 1500
     gpus = args.gpus
@@ -260,14 +291,19 @@ if __name__ == '__main__':
     train_files = [l.rstrip('\n') for l in open(args.train).readlines()]
     random.shuffle(train_files)
 
-    if args.model == 'bert':
+    if args.model == 'bert' or args.model == 'bert-very-large':
         tokenizer = transformers.BertTokenizerFast.from_pretrained(args.tokenizer)
         input_size = 512
+        batch_size = 24 if args.model == 'bert' else 3
+        accumulate_grad_batches = 4 if args.model == 'bert' else 32
         data = EccoDataModule(batch_size=batch_size, tokenizer=tokenizer, input_size=input_size, train_files=train_files, dev_fname=args.eval)
     else:
-        tokenizer = transformers.BigBirdTokenizerFast.from_pretrained(args.tokenizer)
+        # tokenizer = transformers.BigBirdTokenizerFast.from_pretrained(args.tokenizer)
+        tokenizer = transformers.BertTokenizerFast.from_pretrained(args.tokenizer)
         input_size = 4096
         block_size = 64 # TODO: Get from configuration or model
+        batch_size = 2
+        accumulate_grad_batches = 16
         data = EccoBigBirdDataModule(batch_size=batch_size, tokenizer=tokenizer, input_size=input_size, train_files=train_files, dev_fname=args.eval, block_size=block_size)
 
     print(f"Number of nodes {num_nodes}, GPUs per node {gpus}, batch size {batch_size}, accumulate_grad_batches {accumulate_grad_batches}, learning rate {lr}")
@@ -307,7 +343,7 @@ if __name__ == '__main__':
         # max_epochs=2,
         accumulate_grad_batches=accumulate_grad_batches,
         progress_bar_refresh_rate=50, # Large value prevents crashing in colab
-        callbacks=[CheckpointSteps(out_dir=args.out_dir, every_n_steps=10000), lr_monitor],
+        callbacks=[CheckpointSteps(out_dir=args.out_dir, every_n_steps=1000), lr_monitor],
         checkpoint_callback=False,
         # reload_dataloaders_every_epoch=True, # TODO: Will be removed in Pytorch Lightning v1.6. Replace with the line below.
         ## reload_dataloaders_every_n_epochs=1,
