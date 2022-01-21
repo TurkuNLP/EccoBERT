@@ -20,7 +20,7 @@ with open(args.csv, newline='') as f:
     lines = list(reader)
     random.shuffle(lines)
 
-intervals = [math.floor(0.01*len(lines)), math.floor(0.02*len(lines))]
+intervals = [math.floor(0.05*len(lines)), math.floor(0.1*len(lines))]
 
 train = lines[intervals[1]:]
 dev = lines[intervals[0]:intervals[1]]

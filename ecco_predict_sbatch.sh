@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --account=Project_2000539
-#SBATCH --time=02:00:00
+#SBATCH --account=Project_2005072
+#SBATCH --time=14:00:00
 ##SBATCH --time=00:15:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --mem=32G
+##SBATCH --mem=32G
 #SBATCH --partition=gpusmall
 ##SBATCH --partition=gputest
 #SBATCH --gres=gpu:a100:1,nvme:8
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=32
 
 module purge
 module load pytorch/1.9
@@ -31,7 +31,7 @@ echo "Slurm job ID: $SLURM_JOB_ID"
 
 if [ $# -eq 5 ]
 then
-    srun python ecco_predict.py $TOKENIZER $MODEL $DEVDATA $OUTDIR --train $TRAINDATA  --gpus $NGPUS --nodes $NNODES 
+    srun python ecco_predict.py $TOKENIZER $MODEL $DEVDATA $OUTDIR --train $TRAINDATA  --gpus $NGPUS --nodes $NNODES
 elif [ $# -eq 6 ]
 then
     srun python ecco_predict.py $TOKENIZER $MODEL $DEVDATA $OUTDIR --train $TRAINDATA  --gpus $NGPUS --nodes $NNODES --load_checkpoint $6
