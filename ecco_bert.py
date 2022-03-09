@@ -66,6 +66,10 @@ class EccoBERT(pl.LightningModule):
         # loss_function = torch.nn.CrossEntropyLoss()
         # self.log('masked_lm_loss', loss_function(outputs.prediction_logits.view(-1, self.bert.config.vocab_size), batch['label'].view(-1)))
         # self.log('next_sentence_loss', loss_function(outputs.seq_relationship_logits.view(-1, 2), batch['next_sentence_label'].view(-1)))
+        # if batch_idx % 1000 == 0:
+        #     print([tokenizer.convert_ids_to_tokens(e.item()) for t in batch['label'] for e in t if e.item() >= 0], flush=True)
+        #     print([tokenizer.convert_ids_to_tokens(t) for t in batch['input_ids']], flush=True)
+
         return outputs.loss
 
     def validation_step(self,batch,batch_idx):
