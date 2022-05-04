@@ -11,12 +11,14 @@
 #SBATCH --cpus-per-task=32
 
 module purge
-module load pytorch/1.9
+module load pytorch/1.11
 
 export TORCH_EXTENSIONS_DIR=$LOCAL_SCRATCH
 export TMPDIR=$LOCAL_SCRATCH
 export PYTORCH_PRETRAINED_BERT_CACHE=$TMPDIR
 export NCCL_IB_DISABLE=1
+
+# pip install git+https://github.com/huggingface/transformers --user
 
 NGPUS=4
 NNODES=2
@@ -31,8 +33,8 @@ echo "Slurm job ID: $SLURM_JOB_ID"
 
 if [ $# -eq 5 ]
 then
-    srun python ecco_bert.py $TOKENIZER $TRAINDATA $DEVDATA $OUTDIR --model $MODEL --gpus $NGPUS --nodes $NNODES --keep_structure
+    srun python ecco_bert.py $TOKENIZER $TRAINDATA $DEVDATA $OUTDIR --model $MODEL --gpus $NGPUS --nodes $NNODES
 elif [ $# -eq 6 ]
 then
-    srun python ecco_bert.py $TOKENIZER $TRAINDATA $DEVDATA $OUTDIR --model $MODEL --gpus $NGPUS --nodes $NNODES --keep_structure --load_checkpoint $6
+    srun python ecco_bert.py $TOKENIZER $TRAINDATA $DEVDATA $OUTDIR --model $MODEL --gpus $NGPUS --nodes $NNODES --load_checkpoint $6
 fi
